@@ -1,0 +1,534 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: users
+    // Document ID: userId (matches auth.uid)
+    // Fields:
+    //   - uid: string (required, 1-128 chars, matches auth.uid and document ID)
+    //   - username: string (required, 2-50 chars, alphanumeric/underscore/dot)
+    //   - displayName: string (required, 1-100 chars)
+    //   - email: string (required, valid email format, max 254 chars)
+    //   - avatarUrl: string (optional, 0-2048 chars, valid URL or empty)
+    //   - bannerUrl: string (optional, 0-2048 chars, valid URL or empty)
+    //   - bio: string (optional, 0-500 chars)
+    //   - followersCount: int (required, >= 0)
+    //   - followingCount: int (required, >= 0)
+    //   - postsCount: int (required, >= 0)
+    //   - createdAt: timestamp (required, recent on create, immutable on update)
+    //
+    // Collection: follows
+    // Document ID: followId (${followerId}_${followingId})
+    // Fields:
+    //   - followerId: string (required, matches auth.uid on create)
+    //   - followingId: string (required, target user ID != followerId)
+    //   - createdAt: timestamp (required, recent on create)
+    //
+    // Collection: posts
+    // Document ID: postId
+    // Fields:
+    //   - authorId: string (required, matches auth.uid on create, immutable on update)
+    //   - type: string (required, 'long_video' | 'short_video' | 'gif' | 'image')
+    //   - title: string (required, 1-300 chars)
+    //   - mediaUrl: string (required, 1-2048 chars, valid URL)
+    //   - description: string (optional, 0-5000 chars)
+    //   - thumbnailUrl: string (optional, 0-2048 chars, valid URL)
+    //   - tags: list of strings (optional, <= 20 items)
+    //   - likesCount: int (required, >= 0)
+    //   - viewsCount: int (required, >= 0)
+    //   - commentsCount: int (required, >= 0)
+    //   - duration: number (optional, >= 0, video duration in seconds)
+    //   - authorName: string (optional, <= 100 chars)
+    //   - authorAvatarUrl: string (optional, <= 2048 chars)
+    //   - createdAt: timestamp (required, recent on create, immutable on update)
+    //   - updatedAt: timestamp (optional)
+    //
+    // Subcollection: posts/{postId}/likes/{userId}
+    // Document ID: userId (matches auth.uid)
+    // Fields:
+    //   - userId: string (required, matches auth.uid)
+    //   - postId: string (optional, matches parent postId)
+    //   - createdAt: timestamp (required, recent on create)
+    //
+    // Subcollection: posts/{postId}/comments/{commentId}
+    // Document ID: commentId
+    // Fields:
+    //   - authorId: string (required, matches auth.uid on create, immutable on update)
+    //   - postId: string (optional, matches parent postId)
+    //   - text: string (required, 1-2000 chars)
+    //   - mediaUrl: string (optional, 0-2048 chars)
+    //   - likesCount: int (required, >= 0)
+    //   - authorName: string (optional, <= 100 chars)
+    //   - authorAvatarUrl: string (optional, <= 2048 chars)
+    //   - createdAt: timestamp (required, recent on create, immutable on update)
+    //   - updatedAt: timestamp (optional)
+    //
+    // Collection: chats
+    // Document ID: chatId
+    // Fields:
+    //   - creatorId: string (required, matches auth.uid on create, immutable on update)
+    //   - memberIds: list of strings (required, size 1-100, must include auth.uid)
+    //   - name: string (optional, 1-100 chars)
+    //   - isGroup: bool (optional)
+    //   - avatarUrl: string (optional, 0-2048 chars)
+    //   - lastMessage: map (optional, allowed keys: text, senderId, senderName, timestamp, mediaUrl, type)
+    //   - createdAt: timestamp (required, recent on create, immutable on update)
+    //   - updatedAt: timestamp (required)
+    //
+    // Subcollection: chats/{chatId}/messages/{messageId}
+    // Document ID: messageId
+    // Fields:
+    //   - senderId: string (required, matches auth.uid on create, member of parent chat)
+    //   - text: string (optional, 0-5000 chars)
+    //   - mediaUrl: string (optional, 0-2048 chars)
+    //   - type: string (optional, 'text' | 'image' | 'video' | 'gif' | 'media')
+    //   - senderName: string (optional, <= 100 chars)
+    //   - senderAvatar: string (optional, <= 2048 chars)
+    //   - createdAt: timestamp (required, recent on create, immutable on update)
+    //
+    // ===============================================================
+
+    // Default deny all access at the root
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function areImmutableFieldsUnchanged(fields) {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(fields);
+    }
+
+    function isValidUrl(url) {
+      return url is string &&
+        (url.matches('^https://.*') || url.matches('^http://.*') || url == '');
+    }
+
+    function isValidEmail(email) {
+      return email is string &&
+        email.matches('^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$');
+    }
+
+    function isValidOptionalString(field, minLen, maxLen) {
+      return !(field in request.resource.data) ||
+             (request.resource.data[field] is string &&
+              request.resource.data[field].size() >= minLen &&
+              request.resource.data[field].size() <= maxLen);
+    }
+
+    function isValidOptionalUrl(field) {
+      return !(field in request.resource.data) ||
+             (request.resource.data[field] is string &&
+              (request.resource.data[field] == '' ||
+               request.resource.data[field].matches('^https://.*') ||
+               request.resource.data[field].matches('^http://.*')));
+    }
+
+    function isRecent(time) {
+      return time is timestamp &&
+             time > request.time - duration.value(5, 'm') &&
+             time <= request.time + duration.value(1, 'm');
+    }
+
+    // ===============================================================
+    // Domain Validators
+    // ===============================================================
+
+    function isValidUser(data) {
+      let requiredKeys = ['uid', 'username', 'displayName', 'email', 'followersCount', 'followingCount', 'postsCount', 'createdAt'];
+      let allowedKeys = ['uid', 'username', 'displayName', 'email', 'avatarUrl', 'bio', 'bannerUrl', 'followersCount', 'followingCount', 'postsCount', 'createdAt'];
+
+      return data.keys().hasAll(requiredKeys) &&
+             data.keys().hasOnly(allowedKeys) &&
+             data.uid is string &&
+             data.uid.size() >= 1 &&
+             data.uid.size() <= 128 &&
+             data.username is string &&
+             data.username.size() >= 2 &&
+             data.username.size() <= 50 &&
+             data.username.matches('^[a-zA-Z0-9_.]+$') &&
+             data.displayName is string &&
+             data.displayName.size() >= 1 &&
+             data.displayName.size() <= 100 &&
+             isValidEmail(data.email) &&
+             data.email.size() <= 254 &&
+             isValidOptionalString('bio', 0, 500) &&
+             isValidOptionalUrl('avatarUrl') &&
+             (!('avatarUrl' in data) || data.avatarUrl.size() <= 2048) &&
+             isValidOptionalUrl('bannerUrl') &&
+             (!('bannerUrl' in data) || data.bannerUrl.size() <= 2048) &&
+             data.followersCount is int &&
+             data.followersCount >= 0 &&
+             data.followingCount is int &&
+             data.followingCount >= 0 &&
+             data.postsCount is int &&
+             data.postsCount >= 0 &&
+             data.createdAt is timestamp;
+    }
+
+    function isUserOwnerUpdate(userId) {
+      return isOwner(userId) &&
+             isValidUser(request.resource.data) &&
+             areImmutableFieldsUnchanged(['uid', 'email', 'username', 'createdAt', 'followersCount']);
+    }
+
+    function isValidFollowerCountUpdate(targetUserId) {
+      let diffKeys = request.resource.data.diff(resource.data).affectedKeys();
+      let diff = request.resource.data.followersCount - resource.data.followersCount;
+      let followDoc = /databases/$(database)/documents/follows/$(request.auth.uid + '_' + targetUserId);
+      let isIncrement = diff == 1 && (
+        (!exists(followDoc) && existsAfter(followDoc)) ||
+        exists(followDoc)
+      );
+      let isDecrement = diff == -1 && (
+        (exists(followDoc) && !existsAfter(followDoc)) ||
+        !exists(followDoc)
+      );
+
+      return isAuthenticated() &&
+             request.auth.uid != targetUserId &&
+             diffKeys.hasOnly(['followersCount']) &&
+             request.resource.data.followersCount >= 0 &&
+             isValidUser(request.resource.data) &&
+             (isIncrement || isDecrement);
+    }
+
+    function isValidFollow(data, followId) {
+      return data.keys().hasAll(['followerId', 'followingId', 'createdAt']) &&
+             data.keys().hasOnly(['followerId', 'followingId', 'createdAt']) &&
+             data.followerId is string &&
+             data.followerId == request.auth.uid &&
+             data.followingId is string &&
+             data.followingId.size() >= 1 &&
+             data.followingId.size() <= 128 &&
+             data.followerId != data.followingId &&
+             followId == data.followerId + '_' + data.followingId &&
+             data.createdAt is timestamp &&
+             isRecent(data.createdAt);
+    }
+
+    function isValidPost(data) {
+      let requiredKeys = ['authorId', 'type', 'title', 'mediaUrl', 'likesCount', 'viewsCount', 'commentsCount', 'createdAt'];
+      let allowedKeys = [
+        'id', 'postId', 'authorId', 'type', 'title', 'mediaUrl',
+        'thumbnailUrl', 'description', 'tags', 'likesCount',
+        'viewsCount', 'commentsCount', 'duration', 'authorName',
+        'authorAvatarUrl', 'createdAt', 'updatedAt'
+      ];
+
+      return data.keys().hasAll(requiredKeys) &&
+             data.keys().hasOnly(allowedKeys) &&
+             data.authorId is string &&
+             data.authorId.size() >= 1 &&
+             data.authorId.size() <= 128 &&
+             data.type in ['long_video', 'short_video', 'gif', 'image'] &&
+             data.title is string &&
+             data.title.size() >= 1 &&
+             data.title.size() <= 300 &&
+             isValidUrl(data.mediaUrl) &&
+             data.mediaUrl.size() <= 2048 &&
+             isValidOptionalUrl('thumbnailUrl') &&
+             (!('thumbnailUrl' in data) || data.thumbnailUrl.size() <= 2048) &&
+             isValidOptionalString('description', 0, 5000) &&
+             isValidOptionalString('authorName', 0, 100) &&
+             isValidOptionalUrl('authorAvatarUrl') &&
+             (!('authorAvatarUrl' in data) || data.authorAvatarUrl.size() <= 2048) &&
+             isValidOptionalString('id', 1, 128) &&
+             isValidOptionalString('postId', 1, 128) &&
+             (!('tags' in data) || (data.tags is list && data.tags.size() <= 20)) &&
+             (!('duration' in data) || (data.duration is number && data.duration >= 0 && data.duration <= 86400)) &&
+             data.likesCount is int &&
+             data.likesCount >= 0 &&
+             data.viewsCount is int &&
+             data.viewsCount >= 0 &&
+             data.commentsCount is int &&
+             data.commentsCount >= 0 &&
+             data.createdAt is timestamp &&
+             (!('updatedAt' in data) || data.updatedAt is timestamp);
+    }
+
+    function isPostAuthor(authorId) {
+      return isAuthenticated() && request.auth.uid == authorId;
+    }
+
+    function isPostAuthorUpdate() {
+      return isValidPost(request.resource.data) &&
+             areImmutableFieldsUnchanged(['authorId', 'createdAt', 'type', 'mediaUrl']);
+    }
+
+    function isValidPostCounterUpdate(postId) {
+      let diffKeys = request.resource.data.diff(resource.data).affectedKeys();
+      let allowedCounters = ['likesCount', 'viewsCount', 'commentsCount', 'updatedAt'];
+      let likeDoc = /databases/$(database)/documents/posts/$(postId)/likes/$(request.auth.uid);
+
+      let validLikes = !diffKeys.hasAny(['likesCount']) || (
+        (
+          (request.resource.data.likesCount == resource.data.likesCount + 1) &&
+          ((!exists(likeDoc) && existsAfter(likeDoc)) || exists(likeDoc))
+        ) ||
+        (
+          (request.resource.data.likesCount == resource.data.likesCount - 1) &&
+          ((exists(likeDoc) && !existsAfter(likeDoc)) || !exists(likeDoc))
+        )
+      );
+
+      let validViews = !diffKeys.hasAny(['viewsCount']) || (
+        request.resource.data.viewsCount == resource.data.viewsCount + 1
+      );
+
+      let validComments = !diffKeys.hasAny(['commentsCount']) || (
+        request.resource.data.commentsCount == resource.data.commentsCount + 1 ||
+        request.resource.data.commentsCount == resource.data.commentsCount - 1
+      );
+
+      return isValidPost(request.resource.data) &&
+             diffKeys.hasOnly(allowedCounters) &&
+             validLikes &&
+             validViews &&
+             validComments &&
+             areImmutableFieldsUnchanged([
+               'authorId', 'createdAt', 'type', 'title', 'mediaUrl',
+               'thumbnailUrl', 'description', 'tags', 'duration',
+               'authorName', 'authorAvatarUrl'
+             ]);
+    }
+
+    function isValidLike(data, postId, userId) {
+      return data.keys().hasAll(['userId', 'createdAt']) &&
+             data.keys().hasOnly(['userId', 'postId', 'createdAt']) &&
+             data.userId is string &&
+             data.userId == request.auth.uid &&
+             data.userId == userId &&
+             (!('postId' in data) || (data.postId is string && data.postId == postId)) &&
+             data.createdAt is timestamp &&
+             isRecent(data.createdAt);
+    }
+
+    function isValidComment(data, postId) {
+      return data.keys().hasAll(['authorId', 'text', 'likesCount', 'createdAt']) &&
+             data.keys().hasOnly(['id', 'commentId', 'postId', 'authorId', 'text', 'mediaUrl', 'likesCount', 'authorName', 'authorAvatarUrl', 'createdAt', 'updatedAt']) &&
+             data.authorId is string &&
+             data.authorId.size() >= 1 &&
+             data.authorId.size() <= 128 &&
+             data.text is string &&
+             data.text.size() >= 1 &&
+             data.text.size() <= 2000 &&
+             isValidOptionalUrl('mediaUrl') &&
+             (!('mediaUrl' in data) || data.mediaUrl.size() <= 2048) &&
+             (!('postId' in data) || (data.postId is string && data.postId == postId)) &&
+             (!('authorName' in data) || (data.authorName is string && data.authorName.size() <= 100)) &&
+             (!('authorAvatarUrl' in data) || (data.authorAvatarUrl is string && data.authorAvatarUrl.size() <= 2048 && isValidUrl(data.authorAvatarUrl))) &&
+             data.likesCount is int &&
+             data.likesCount >= 0 &&
+             data.createdAt is timestamp &&
+             (!('updatedAt' in data) || data.updatedAt is timestamp);
+    }
+
+    function isCommentAuthor(authorId) {
+      return isAuthenticated() && request.auth.uid == authorId;
+    }
+
+    function isCommentAuthorUpdate(postId) {
+      return isValidComment(request.resource.data, postId) &&
+             areImmutableFieldsUnchanged(['authorId', 'createdAt', 'postId']);
+    }
+
+    function isValidCommentLikesUpdate(postId) {
+      let diffKeys = request.resource.data.diff(resource.data).affectedKeys();
+      let diff = request.resource.data.likesCount - resource.data.likesCount;
+      return isValidComment(request.resource.data, postId) &&
+             diffKeys.hasOnly(['likesCount']) &&
+             (diff == 1 || diff == -1) &&
+             request.resource.data.likesCount >= 0 &&
+             areImmutableFieldsUnchanged(['authorId', 'createdAt', 'postId', 'text', 'mediaUrl', 'authorName', 'authorAvatarUrl']);
+    }
+
+    function isValidChat(data) {
+      return data.keys().hasAll(['creatorId', 'memberIds', 'createdAt', 'updatedAt']) &&
+             data.keys().hasOnly(['id', 'chatId', 'creatorId', 'memberIds', 'name', 'isGroup', 'avatarUrl', 'lastMessage', 'createdAt', 'updatedAt']) &&
+             data.creatorId is string &&
+             data.creatorId.size() >= 1 &&
+             data.creatorId.size() <= 128 &&
+             data.memberIds is list &&
+             data.memberIds.size() >= 1 &&
+             data.memberIds.size() <= 100 &&
+             (!('name' in data) || (data.name is string && data.name.size() >= 1 && data.name.size() <= 100)) &&
+             (!('isGroup' in data) || data.isGroup is bool) &&
+             isValidOptionalUrl('avatarUrl') &&
+             (!('avatarUrl' in data) || data.avatarUrl.size() <= 2048) &&
+             (!('lastMessage' in data) || (
+               data.lastMessage is map &&
+               data.lastMessage.keys().hasOnly(['text', 'senderId', 'senderName', 'timestamp', 'mediaUrl', 'type']) &&
+               (!('text' in data.lastMessage) || (data.lastMessage.text is string && data.lastMessage.text.size() <= 5000)) &&
+               (!('senderId' in data.lastMessage) || (data.lastMessage.senderId is string && data.lastMessage.senderId.size() <= 128)) &&
+               (!('mediaUrl' in data.lastMessage) || (data.lastMessage.mediaUrl is string && data.lastMessage.mediaUrl.size() <= 2048))
+             )) &&
+             data.createdAt is timestamp &&
+             data.updatedAt is timestamp;
+    }
+
+    function isChatMember(chatId) {
+      return request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.memberIds;
+    }
+
+    function isValidMessage(data) {
+      return data.keys().hasAll(['senderId', 'createdAt']) &&
+             data.keys().hasOnly(['id', 'messageId', 'chatId', 'senderId', 'text', 'mediaUrl', 'type', 'senderName', 'senderAvatar', 'createdAt']) &&
+             data.senderId is string &&
+             data.senderId.size() >= 1 &&
+             data.senderId.size() <= 128 &&
+             (('text' in data && data.text is string && data.text.size() > 0 && data.text.size() <= 5000) ||
+              ('mediaUrl' in data && data.mediaUrl is string && data.mediaUrl.size() > 0 && data.mediaUrl.size() <= 2048)) &&
+             (!('text' in data) || (data.text is string && data.text.size() <= 5000)) &&
+             isValidOptionalUrl('mediaUrl') &&
+             (!('mediaUrl' in data) || data.mediaUrl.size() <= 2048) &&
+             (!('type' in data) || (data.type is string && data.type in ['text', 'image', 'video', 'gif', 'media'])) &&
+             (!('senderName' in data) || (data.senderName is string && data.senderName.size() <= 100)) &&
+             (!('senderAvatar' in data) || (data.senderAvatar is string && data.senderAvatar.size() <= 2048 && isValidUrl(data.senderAvatar))) &&
+             data.createdAt is timestamp;
+    }
+
+    // ===============================================================
+    // Collection Rules
+    // ===============================================================
+
+    // 1. Users collection
+    match /users/{userId} {
+      allow read: if true;
+
+      allow create: if isAuthenticated() &&
+                       isOwner(userId) &&
+                       request.resource.data.uid == userId &&
+                       (!('email' in request.auth.token) || request.resource.data.email == request.auth.token.email) &&
+                       isValidUser(request.resource.data) &&
+                       request.resource.data.followersCount == 0 &&
+                       request.resource.data.followingCount == 0 &&
+                       request.resource.data.postsCount == 0 &&
+                       isRecent(request.resource.data.createdAt);
+
+      allow update: if isUserOwnerUpdate(userId) || isValidFollowerCountUpdate(userId);
+
+      allow delete: if false;
+    }
+
+    // 2. Follows collection
+    match /follows/{followId} {
+      allow read: if true;
+
+      allow create: if isAuthenticated() &&
+                       request.auth.uid == request.resource.data.followerId &&
+                       isValidFollow(request.resource.data, followId);
+
+      allow update: if false;
+
+      allow delete: if isAuthenticated() &&
+                       resource.data.followerId == request.auth.uid;
+    }
+
+    // 3. Posts collection
+    match /posts/{postId} {
+      allow read: if true;
+
+      allow create: if isAuthenticated() &&
+                       request.resource.data.authorId == request.auth.uid &&
+                       isValidPost(request.resource.data) &&
+                       request.resource.data.likesCount == 0 &&
+                       request.resource.data.viewsCount == 0 &&
+                       request.resource.data.commentsCount == 0 &&
+                       isRecent(request.resource.data.createdAt);
+
+      allow update: if (isPostAuthor(resource.data.authorId) && isPostAuthorUpdate()) ||
+                       (isAuthenticated() && isValidPostCounterUpdate(postId));
+
+      allow delete: if isAuthenticated() &&
+                       resource.data.authorId == request.auth.uid;
+
+      // Likes subcollection
+      match /likes/{userId} {
+        allow read: if true;
+
+        allow create: if isAuthenticated() &&
+                         request.auth.uid == userId &&
+                         isValidLike(request.resource.data, postId, userId);
+
+        allow update: if false;
+
+        allow delete: if isAuthenticated() &&
+                         request.auth.uid == userId;
+      }
+
+      // Comments subcollection
+      match /comments/{commentId} {
+        allow read: if true;
+
+        allow create: if isAuthenticated() &&
+                         request.resource.data.authorId == request.auth.uid &&
+                         isValidComment(request.resource.data, postId) &&
+                         request.resource.data.likesCount == 0 &&
+                         isRecent(request.resource.data.createdAt);
+
+        allow update: if (isCommentAuthor(resource.data.authorId) && isCommentAuthorUpdate(postId)) ||
+                         (isAuthenticated() && isValidCommentLikesUpdate(postId));
+
+        allow delete: if isAuthenticated() &&
+                         resource.data.authorId == request.auth.uid;
+      }
+    }
+
+    // 4. Chats collection
+    match /chats/{chatId} {
+      allow read: if isAuthenticated() &&
+                     (request.auth.uid in resource.data.memberIds);
+
+      allow create: if isAuthenticated() &&
+                       request.auth.uid == request.resource.data.creatorId &&
+                       (request.auth.uid in request.resource.data.memberIds) &&
+                       isValidChat(request.resource.data) &&
+                       isRecent(request.resource.data.createdAt);
+
+      allow update: if isAuthenticated() &&
+                       (request.auth.uid in resource.data.memberIds) &&
+                       isValidChat(request.resource.data) &&
+                       areImmutableFieldsUnchanged(['creatorId', 'createdAt']);
+
+      allow delete: if isAuthenticated() &&
+                       resource.data.creatorId == request.auth.uid;
+
+      // Messages subcollection
+      match /messages/{messageId} {
+        allow read: if isAuthenticated() &&
+                       isChatMember(chatId);
+
+        allow create: if isAuthenticated() &&
+                         request.resource.data.senderId == request.auth.uid &&
+                         isChatMember(chatId) &&
+                         isValidMessage(request.resource.data) &&
+                         isRecent(request.resource.data.createdAt);
+
+        allow update: if isAuthenticated() &&
+                         resource.data.senderId == request.auth.uid &&
+                         isChatMember(chatId) &&
+                         isValidMessage(request.resource.data) &&
+                         areImmutableFieldsUnchanged(['senderId', 'createdAt']);
+
+        allow delete: if isAuthenticated() &&
+                         resource.data.senderId == request.auth.uid;
+      }
+    }
+
+  }
+}
